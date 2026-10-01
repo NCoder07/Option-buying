@@ -1,0 +1,43 @@
+# Secrets — NEVER commit real credentials
+.env
+*.env
+bot.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Dhan_Tradehull token cache & instrument master
+Dependencies/
+token_*.txt
+state_test/
+
+# Mutable runtime state
+data/
+journal/
+*.sqlite
+*.db
+
+# Logs
+logs/
+*.log
+
+# Reports (generated artifacts)
+reports/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Compiled docs
+*.docx

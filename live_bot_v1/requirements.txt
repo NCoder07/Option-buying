@@ -1,0 +1,40 @@
+# ============================================================
+# live_bot_v1 — pinned requirements
+# ============================================================
+# Core broker wrapper
+Dhan_Tradehull>=3.3.2
+dhanhq>=2.2.0
+
+# Async + websockets (already a dep of dhanhq)
+websockets>=12.0
+
+# Data / calendar
+pandas>=2.1.0
+pandas-market-calendars>=4.3.1
+numpy>=1.26.0
+pyarrow>=15.0.0
+
+# Config + env
+pyyaml>=6.0.1
+pydantic>=2.6.0
+pydantic-settings>=2.2.0
+python-dotenv>=1.0.1
+
+# TOTP (already a dep of Dhan_Tradehull)
+pyotp>=2.9.0
+
+# Timezone
+pytz>=2024.1
+
+# Telegram alerts
+requests>=2.31.0
+
+# SQLite ORM-lite
+# (stdlib sqlite3 used directly — no extra dep)
+
+# Logging rotation (stdlib logging.handlers used)
+
+# Dev / test extras (not installed on VM production)
+# pytest>=8.1.0
+# pytest-asyncio>=0.23.0
+# freezegun>=1.4.0

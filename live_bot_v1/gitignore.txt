@@ -1,0 +1,37 @@
+# Rename this file to .gitignore on the VM
+# Secrets
+.env
+*.env
+bot.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Dhan_Tradehull token cache
+Dependencies/
+token_*.txt
+
+# Mutable runtime state
+data/
+journal/
+*.sqlite
+*.db
+
+# Logs
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

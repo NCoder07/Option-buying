@@ -1,0 +1,158 @@
+# ============================================================
+# live_bot_v1 — Strategy Configuration
+# NIFTY 50 Weekly Option Buying Strategy v1
+#
+# All paths are derived from BASE_DIR/DATA_DIR env/config;
+# no hard-coded /Users/... or VM paths anywhere in code.
+# Edit this file for environment-specific overrides.
+# ============================================================
+
+# ------------------------------------------------------------------
+# Mode: "paper" (default) or "live"
+# "live" additionally requires CLI flag --live AND env CONFIRM_LIVE=YES
+# ------------------------------------------------------------------
+mode: "paper"
+
+# ------------------------------------------------------------------
+# Underlying & instrument
+# ------------------------------------------------------------------
+underlying: "NIFTY"           # Only NIFTY index options on NFO
+exchange: "NFO"               # Dhan order_placement exchange param
+index_exchange_for_ltp: "NIFTY"  # Tradehull get_ltp_data key
+
+# ------------------------------------------------------------------
+# Expiry selection (data-driven, not weekday-hardcoded)
+# ------------------------------------------------------------------
+# If today is NOT an expiry day → nearest weekly expiry (index 0)
+# If today IS an expiry day     → next weekly expiry (index 1)
+# Determined at runtime from get_expiry_list()
+
+# ------------------------------------------------------------------
+# 09:20 strike selection
+# ------------------------------------------------------------------
+selection_time: "09:20:00"         # HH:MM:SS IST
+ltp_band_low: 50.0                 # Minimum LTP (inclusive)
+ltp_band_high: 75.0                # Maximum LTP (inclusive)
+target_mid: 62.5                   # Select strike minimising |LTP - target_mid|
+tie_break: "lower_strike"          # "lower_strike" | "higher_premium"
+
+# ------------------------------------------------------------------
+# Trigger
+# ------------------------------------------------------------------
+trigger_multiplier: 1.50           # trigger = P0 * 1.50
+tick_size: 0.05                    # NSE index options tick size
+# Trigger rounding: round to nearest tick using ROUND_HALF_UP (towards exchange)
+
+# ------------------------------------------------------------------
+# Gap-cross policy
+# If first observation after 09:20 is already >= trigger (gap-through):
+# ------------------------------------------------------------------
+gap_cross_policy: "enter"          # "enter" | "skip"
+
+# ------------------------------------------------------------------
+# Entry order
+# ------------------------------------------------------------------
+entry_limit_buffer: 0.50           # Ask + this buffer = LIMIT BUY price (₹ per unit)
+max_entry_slippage_pct: 5.0        # % over trigger; if cap blocks entry → "skipped_cap"
+entry_fill_timeout_sec: 5          # Seconds to wait for fill before cancel
+entry_retry: true                  # Retry once at fresh ask after timeout
+entry_cutoff_time: "15:25:00"      # No new entries after this time (technical cutoff)
+# Entries between 15:00 and 15:25 are flagged "late_entry" in journal
+
+# ------------------------------------------------------------------
+# Stop loss
+# ------------------------------------------------------------------
+sl_multiplier: 0.50                # SL = 0.50 * actual_avg_fill_price
+# SL rounding: round DOWN to tick (conservative: SL is lower, harder to hit accidentally)
+exit_limit_buffer: 0.50            # Bid - this buffer = LIMIT SELL price (₹ per unit)
+exit_fill_timeout_sec: 5           # Seconds to wait for SL fill before escalation
+use_exchange_sl: false             # false = software SL only (recommended)
+
+# Exit escalation: if LIMIT SELL not filled within exit_fill_timeout_sec
+# "widen_and_retry": cancel, subtract additional buffer, retry (up to exit_escalation_max_retries)
+# "market": send MARKET SELL (not available on NSE options; use very wide LIMIT instead)
+exit_escalation: "widen_and_retry"
+exit_escalation_max_retries: 5
+exit_escalation_additional_buffer: 0.50  # Extra buffer per retry step
+
+# ------------------------------------------------------------------
+# Exit: next trading day at 09:25
+# ------------------------------------------------------------------
+exit_time: "09:25:00"              # Mandatory time exit (next trading day)
+exit_monitor_start: "09:15:00"     # Start monitoring overnight positions from this time
+
+# ------------------------------------------------------------------
+# Sizing
+# ------------------------------------------------------------------
+lots: 1                            # Number of lots to trade
+max_lots: 2                        # Hard cap
+max_order_value: 200000            # Hard cap in ₹ (premium × qty × lots)
+# lot_size: read from instrument master at runtime — never hard-coded
+
+# ------------------------------------------------------------------
+# Circuit breakers
+# ------------------------------------------------------------------
+max_orders_per_day: 10             # Hard limit across CE+PE
+max_consecutive_rejections: 3      # Halt + alert after N consecutive rejections
+max_daily_loss_inr: 20000          # Halt NEW entries if daily loss exceeds this
+                                   # (open positions are still managed and exited)
+
+# ------------------------------------------------------------------
+# Data freshness & safety checks
+# ------------------------------------------------------------------
+max_quote_age_sec: 10              # Reject quotes older than N seconds
+max_clock_drift_sec: 2.0           # Halt new entries if drift > this
+min_disk_free_gb: 1.0              # Halt new entries + alert below this
+heartbeat_interval_min: 5          # Ping dead-man URL every N minutes during market hours
+
+# ------------------------------------------------------------------
+# Live IP guard
+# ------------------------------------------------------------------
+# expected_static_ip: read from env EXPECTED_STATIC_IP at startup
+# Checked at startup and before first order each day.
+
+# ------------------------------------------------------------------
+# Pre-trade checks (enabled by default)
+# ------------------------------------------------------------------
+pretrade_check_funds: true         # Check available balance >= premium * qty
+pretrade_check_premium_sanity: true
+premium_sanity_min: 1.0            # Reject if selected option LTP < this (sanity floor)
+premium_sanity_max: 500.0          # Reject if selected option LTP > this (sanity ceiling)
+
+# ------------------------------------------------------------------
+# Monitoring / alerts
+# ------------------------------------------------------------------
+# Telegram: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from env
+# Heartbeat: HEARTBEAT_URL from env (optional)
+eod_summary_time: "15:40:00"       # Send end-of-day summary at this time
+
+# ------------------------------------------------------------------
+# Data capture paths (relative to DATA_DIR, which comes from env/CLI)
+# ------------------------------------------------------------------
+# DATA_DIR/<YYYY-MM-DD>/chain_snapshot_<time>.json   — 09:20 option chain
+# DATA_DIR/<YYYY-MM-DD>/ticks_<symbol>.jsonl         — per-poll tick data
+# DATA_DIR/<YYYY-MM-DD>/orders.jsonl                 — order API log
+# DATA_DIR/journal/trades.csv                        — trade journal
+# DATA_DIR/journal/daily_log.csv                     — daily log
+
+# ------------------------------------------------------------------
+# Backup (optional; script-driven, config-driven)
+# ------------------------------------------------------------------
+backup_enabled: false
+backup_rclone_remote: "s3:my-bot-backup/nifty_bot"   # rclone target
+backup_time: "16:00:00"           # Run daily backup after EOD
+
+# ------------------------------------------------------------------
+# ReplayBroker (dev machine only)
+# ------------------------------------------------------------------
+# DATA_DIR on dev machine set via BOT_DATA_DIR env var
+# ReplayBroker reads 1-min historical candles from DATA_DIR
+replay_speed: 1.0                  # 1.0 = real-time; 0.0 = as fast as possible
+
+# ------------------------------------------------------------------
+# Dhan_Tradehull quirks / workarounds
+# ------------------------------------------------------------------
+# Tradehull hard-codes "Dependencies/" relative to CWD for token cache & instrument file.
+# The bot chdirs to STATE_DIR at startup so these files land in the right place.
+# STATE_DIR defaults to /var/lib/nifty_bot on VM or DATA_DIR/state on dev.
+tradehull_dependencies_subdir: "Dependencies"  # do not change

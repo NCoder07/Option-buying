@@ -1,0 +1,50 @@
+[Unit]
+Description=NIFTY 50 Weekly Option Buying Bot
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+User=nifty_bot
+Group=nifty_bot
+WorkingDirectory=/opt/nifty_bot
+
+# EnvironmentFile contains all secrets (chmod 600, owned by root)
+EnvironmentFile=/etc/nifty_bot/bot.env
+
+# Bot binary
+ExecStart=/opt/nifty_bot/.venv/bin/python /opt/nifty_bot/main.py \
+    --config /etc/nifty_bot/config.yaml \
+    --state-dir /var/lib/nifty_bot \
+    --data-dir /var/lib/nifty_bot/data \
+    --log-dir /var/log/nifty_bot
+
+# Restart on failure with exponential backoff
+Restart=on-failure
+RestartSec=10
+RestartSteps=5
+RestartMaxDelaySec=120
+
+# Prevent restart storms
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Watchdog: bot must call sd_notify WATCHDOG=1 within this window
+WatchdogSec=120
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/nifty_bot /var/log/nifty_bot
+
+# Prevent automatic reboot while market may be open (08:30–15:40 IST)
+# This is handled at the OS level via unattended-upgrades; see RUNBOOK.md.
+
+# Logging: goes to journald (readable with journalctl -u nifty_bot)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nifty_bot
+
+[Install]
+WantedBy=multi-user.target
