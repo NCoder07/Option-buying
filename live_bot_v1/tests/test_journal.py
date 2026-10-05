@@ -54,17 +54,19 @@ class TestJournal:
     def test_tick_data_written(self, tmp_journal):
         j, data_dir = tmp_journal
         j.write_tick("2025-06-12", "NIFTY 12JUN25 25200 CE",
-                     ltp=65.0, bid=64.5, ask=65.5, event="cross_monitor")
+                     ltp=65.0, event="cross_monitor")
         tick_file = data_dir / "2025-06-12" / "ticks_NIFTY_12JUN25_25200_CE.jsonl"
         assert tick_file.exists()
         record = json.loads(tick_file.read_text().strip())
         assert record["ltp"] == 65.0
         assert record["event"] == "cross_monitor"
+        assert "bid" not in record
+        assert "ask" not in record
 
     def test_chain_snapshot_written(self, tmp_journal):
         j, data_dir = tmp_journal
         from bot.broker_port import ChainRow
-        rows = [ChainRow(25200, "CE", "SYM", 65.0, 64.5, 65.5)]
+        rows = [ChainRow(25200, "CE", "SYM", 65.0)]
         j.write_chain_snapshot("2025-06-12", rows, "2025-06-12T09:20:00+05:30")
         snapshots = list((data_dir / "2025-06-12").glob("chain_snapshot_*.json"))
         assert len(snapshots) == 1

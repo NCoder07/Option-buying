@@ -5,6 +5,15 @@ All alert functions are best-effort: they log locally on failure but never
 raise exceptions that could halt the trading loop.
 
 Sensitive values (tokens, account IDs) are masked in log output.
+
+Telegram 404 fix: the bot token must be in the format
+  <bot_id>:<token_string>
+e.g. 7891234567:AAExxxxxxxxxxxxxxxxxxxxxxxx
+A 404 means either the token is wrong or the chat_id is wrong.
+
+Repeated failure throttle: after MAX_CONSECUTIVE_FAILURES consecutive HTTP
+failures, Telegram sends are suppressed for FAILURE_COOLDOWN_SEC seconds.
+This prevents log spam when credentials are misconfigured.
 """
 
 from __future__ import annotations
@@ -25,6 +34,10 @@ IST = pytz.timezone("Asia/Kolkata")
 
 _MASK = lambda s: (s[:4] + "****") if s and len(s) > 4 else "****"
 
+# Throttle: suppress Telegram after this many consecutive failures for this long
+_MAX_CONSECUTIVE_FAILURES = 3
+_FAILURE_COOLDOWN_SEC = 300   # 5 minutes
+
 
 class Alerts:
     def __init__(
@@ -41,6 +54,19 @@ class Alerts:
         self._enabled = bool(self._token and self._chat_id)
         if not self._enabled:
             logger.warning("Telegram alerts disabled (no bot_token/chat_id configured)")
+        else:
+            # Validate token format: must be "<digits>:<alphanum>"
+            if ":" not in self._token or not self._token.split(":")[0].isdigit():
+                logger.warning(
+                    "Telegram bot token appears malformed (expected '<bot_id>:<token>', got '%s...'). "
+                    "This will cause HTTP 404. Fix TELEGRAM_BOT_TOKEN in .env.",
+                    self._token[:8] if self._token else "",
+                )
+
+        # Failure throttle state
+        self._consecutive_failures = 0
+        self._suppressed_until: float = 0.0
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Core send
@@ -59,17 +85,61 @@ class Alerts:
 
         if not self._enabled:
             return False
+
+        # Check throttle
+        with self._lock:
+            now_ts = time.time()
+            if now_ts < self._suppressed_until:
+                remaining = int(self._suppressed_until - now_ts)
+                logger.debug("Telegram suppressed for %ds (consecutive failures)", remaining)
+                return False
+
         try:
             url = (
                 f"https://api.telegram.org/bot{self._token}/sendMessage"
                 f"?chat_id={self._chat_id}&text={urllib.parse.quote(tg_msg)}"
             )
             resp = requests.get(url, timeout=10)
-            if resp.status_code != 200:
-                logger.warning("Telegram alert HTTP %d: %s", resp.status_code, resp.text[:200])
-                return False
-            return True
+            if resp.status_code == 200:
+                with self._lock:
+                    self._consecutive_failures = 0
+                return True
+
+            # Log failure with actionable hint
+            body = resp.text[:200]
+            if resp.status_code == 404:
+                hint = (
+                    "HTTP 404 — token or chat_id is wrong. "
+                    "Check TELEGRAM_BOT_TOKEN (format: <bot_id>:<token>) "
+                    "and TELEGRAM_CHAT_ID in .env"
+                )
+            elif resp.status_code == 400:
+                hint = f"HTTP 400 — bad request: {body}"
+            elif resp.status_code == 401:
+                hint = "HTTP 401 — token is invalid or revoked. Regenerate via BotFather."
+            else:
+                hint = f"HTTP {resp.status_code}: {body}"
+
+            with self._lock:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    self._suppressed_until = time.time() + _FAILURE_COOLDOWN_SEC
+                    logger.warning(
+                        "Telegram alert %s (failure %d/%d) — suppressing for %ds. %s",
+                        hint, self._consecutive_failures, _MAX_CONSECUTIVE_FAILURES,
+                        _FAILURE_COOLDOWN_SEC, hint,
+                    )
+                else:
+                    logger.warning(
+                        "Telegram alert %s (failure %d/%d)",
+                        hint, self._consecutive_failures, _MAX_CONSECUTIVE_FAILURES,
+                    )
+            return False
         except Exception as e:
+            with self._lock:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    self._suppressed_until = time.time() + _FAILURE_COOLDOWN_SEC
             logger.warning("Telegram alert failed: %s", e)
             return False
 

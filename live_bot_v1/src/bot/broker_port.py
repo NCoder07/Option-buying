@@ -4,6 +4,8 @@ broker_port.py — Abstract BrokerPort interface.
 All strategy logic talks ONLY to BrokerPort.  The three concrete
 implementations (LiveDhanBroker, PaperBroker, ReplayBroker) plug in here.
 No Dhan_Tradehull imports anywhere except live_broker.py.
+
+Pricing model: everything is priced off LTP.  No bid/ask or market depth.
 """
 
 from __future__ import annotations
@@ -32,14 +34,10 @@ class OrderStatus(str, Enum):
 
 
 @dataclass
-class Quote:
-    """Snapshot of a single option contract's market data."""
+class LTPSnapshot:
+    """LTP for a single option contract — the only market data used for decisions."""
     symbol: str
     ltp: float
-    bid: float
-    ask: float
-    bid_qty: int = 0
-    ask_qty: int = 0
     timestamp: Optional[datetime] = None     # tz-aware IST
     oi: Optional[float] = None
 
@@ -66,13 +64,19 @@ class Position:
 
 @dataclass
 class ChainRow:
-    """One row from the 09:20 candidate snapshot."""
+    """One row from the 09:20 candidate snapshot.
+
+    bid/ask are stored as-is from the raw API response for archival purposes
+    (the snapshot is written to disk verbatim) but are NEVER read by strategy
+    logic.  All decisions use ltp only.
+    """
     strike: int
     option_type: str                         # "CE" or "PE"
     symbol: str                              # trading symbol
     ltp: float
-    bid: float
-    ask: float
+    # Raw API fields — stored in snapshot JSON only, not used in logic:
+    bid: float = 0.0
+    ask: float = 0.0
     oi: Optional[float] = None
     iv: Optional[float] = None
 
@@ -90,8 +94,11 @@ class BrokerPort(ABC):
         ...
 
     @abstractmethod
-    def get_quote(self, symbol: str) -> Optional[Quote]:
-        """Return full quote (ltp, bid, ask) for one symbol.  None on failure."""
+    def get_ltp_single(self, symbol: str) -> Optional[LTPSnapshot]:
+        """
+        Return an LTPSnapshot for one symbol with a tz-aware IST timestamp.
+        Returns None on any failure.  The timestamp is used for freshness checks.
+        """
         ...
 
     @abstractmethod

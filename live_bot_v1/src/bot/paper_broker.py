@@ -1,8 +1,19 @@
 """
-paper_broker.py — PaperBroker: live market data, simulated fills.
+paper_broker.py — PaperBroker: live market data, deterministic simulated fills.
 
-Identical code path as live — uses real bid/ask from LiveDhanBroker for
-fill simulation.  Orders are logged, never sent to exchange.
+Pricing model: everything off LTP.  No bid/ask.
+
+Fill simulation:
+  - BUY  fills at LTP + paper_slippage_points  (configurable; default 1.0)
+  - SELL fills at LTP - paper_slippage_points
+
+If no valid LTP is available at order time, the order is REJECTED (not filled
+at a default price).  This is the explicit guard against the ₹0.50 fill bug
+that occurred when the previous code fell back to the submitted price.
+
+paper_slippage_points is a clearly-labelled assumption; it is recorded in
+every journal row so forward-test results can be adjusted if the assumption
+turns out to be wrong.
 """
 
 from __future__ import annotations
@@ -15,23 +26,29 @@ from typing import Optional
 import pytz
 
 from .broker_port import (
-    BrokerPort, ChainRow, Fill, OrderStatus, Position, Quote,
+    BrokerPort, ChainRow, Fill, LTPSnapshot, OrderStatus, Position,
 )
 from .live_broker import LiveDhanBroker
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
+_DEFAULT_SLIPPAGE = 1.0   # points per side (assumption; documented in journal)
+
 
 class PaperBroker(BrokerPort):
     """
-    Wraps LiveDhanBroker for market data; simulates fills using live bid/ask.
-    Buys fill at ask; sells fill at bid.
-    All simulated orders are logged with spread information.
+    Wraps LiveDhanBroker for market data; simulates fills using live LTP
+    ± paper_slippage_points.
+
+    All simulated orders are logged.  The fill price is never a submitted
+    price or a default — it is always derived from a freshly-fetched LTP.
+    If no valid LTP exists, the order is REJECTED.
     """
 
-    def __init__(self, live: LiveDhanBroker) -> None:
+    def __init__(self, live: LiveDhanBroker, config: Optional[dict] = None) -> None:
         self._live = live
+        self._slippage = float((config or {}).get("paper_slippage_points", _DEFAULT_SLIPPAGE))
         self._orders: dict[str, dict] = {}     # order_id -> order record
         self._positions: dict[str, Position] = {}  # symbol -> Position
 
@@ -51,8 +68,8 @@ class PaperBroker(BrokerPort):
     def get_ltp(self, symbols: list[str]) -> dict[str, float]:
         return self._live.get_ltp(symbols)
 
-    def get_quote(self, symbol: str) -> Optional[Quote]:
-        return self._live.get_quote(symbol)
+    def get_ltp_single(self, symbol: str) -> Optional[LTPSnapshot]:
+        return self._live.get_ltp_single(symbol)
 
     def get_option_chain_snapshot(
         self, expiry_date: str, num_strikes: int = 20
@@ -69,8 +86,28 @@ class PaperBroker(BrokerPort):
         return self._live.get_lot_size(symbol)
 
     # ------------------------------------------------------------------
-    # Simulated orders
+    # Simulated orders — LTP-based fills only
     # ------------------------------------------------------------------
+
+    def _fetch_ltp_or_reject(self, symbol: str, side: str) -> Optional[float]:
+        """
+        Fetch current LTP.  Returns the ltp float, or None if unavailable.
+        Logs the reason when returning None so callers can REJECT the order.
+        """
+        snap = self._live.get_ltp_single(symbol)
+        if snap is None:
+            logger.error(
+                "[PAPER] %s %s — no_valid_price: LTP fetch returned None; order REJECTED",
+                side, symbol,
+            )
+            return None
+        if snap.ltp <= 0:
+            logger.error(
+                "[PAPER] %s %s — no_valid_price: LTP=%.4f <= 0; order REJECTED",
+                side, symbol, snap.ltp,
+            )
+            return None
+        return snap.ltp
 
     def place_limit_buy(
         self,
@@ -79,31 +116,45 @@ class PaperBroker(BrokerPort):
         qty: int,
         tag: Optional[str] = None,
     ) -> Optional[str]:
-        """Simulate a BUY: fill at live ask (or price if ask unavailable)."""
-        quote = self._live.get_quote(symbol)
-        fill_price = quote.ask if (quote and quote.ask > 0) else price
-        spread = quote.ask - quote.bid if quote else 0.0
-
+        """
+        Simulate a BUY.  Fill at LTP + paper_slippage_points.
+        REJECTS (returns order_id with status REJECTED) if no valid LTP.
+        """
+        ltp = self._fetch_ltp_or_reject(symbol, "BUY")
         order_id = f"PAPER-{uuid.uuid4().hex[:8].upper()}"
+
+        if ltp is None:
+            self._orders[order_id] = {
+                "symbol": symbol, "side": "BUY", "qty": qty,
+                "submitted_price": price, "fill_price": 0.0,
+                "ltp_at_fill": None, "slippage_pts": self._slippage,
+                "status": OrderStatus.REJECTED,
+                "timestamp": datetime.now(IST).isoformat(),
+                "tag": tag,
+                "rejection_reason": "no_valid_price",
+            }
+            logger.error(
+                "[PAPER] BUY  %s qty=%d REJECTED (no_valid_price) tag=%s id=%s",
+                symbol, qty, tag, order_id,
+            )
+            return order_id
+
+        fill_price = round(ltp + self._slippage, 2)
         self._orders[order_id] = {
-            "symbol": symbol,
-            "side": "BUY",
-            "qty": qty,
-            "submitted_price": price,
-            "fill_price": fill_price,
-            "spread": spread,
+            "symbol": symbol, "side": "BUY", "qty": qty,
+            "submitted_price": price, "fill_price": fill_price,
+            "ltp_at_fill": ltp, "slippage_pts": self._slippage,
             "status": OrderStatus.FILLED,
             "timestamp": datetime.now(IST).isoformat(),
             "tag": tag,
         }
         logger.info(
-            "[PAPER] BUY  %s qty=%d submitted=%.2f fill=%.2f spread=%.2f tag=%s id=%s",
-            symbol, qty, price, fill_price, spread, tag, order_id,
+            "[PAPER] BUY  %s qty=%d ltp=%.2f slippage=%.2f fill=%.2f tag=%s id=%s",
+            symbol, qty, ltp, self._slippage, fill_price, tag, order_id,
         )
         # Update paper positions
         pos = self._positions.get(symbol)
         if pos:
-            # Average up
             total_qty = pos.qty + qty
             pos.avg_price = (pos.avg_price * pos.qty + fill_price * qty) / total_qty
             pos.qty = total_qty
@@ -120,26 +171,41 @@ class PaperBroker(BrokerPort):
         qty: int,
         tag: Optional[str] = None,
     ) -> Optional[str]:
-        """Simulate a SELL: fill at live bid (or price if bid unavailable)."""
-        quote = self._live.get_quote(symbol)
-        fill_price = quote.bid if (quote and quote.bid > 0) else price
-        spread = quote.ask - quote.bid if quote else 0.0
-
+        """
+        Simulate a SELL.  Fill at LTP - paper_slippage_points.
+        REJECTS if no valid LTP.
+        """
+        ltp = self._fetch_ltp_or_reject(symbol, "SELL")
         order_id = f"PAPER-{uuid.uuid4().hex[:8].upper()}"
+
+        if ltp is None:
+            self._orders[order_id] = {
+                "symbol": symbol, "side": "SELL", "qty": qty,
+                "submitted_price": price, "fill_price": 0.0,
+                "ltp_at_fill": None, "slippage_pts": self._slippage,
+                "status": OrderStatus.REJECTED,
+                "timestamp": datetime.now(IST).isoformat(),
+                "tag": tag,
+                "rejection_reason": "no_valid_price",
+            }
+            logger.error(
+                "[PAPER] SELL %s qty=%d REJECTED (no_valid_price) tag=%s id=%s",
+                symbol, qty, tag, order_id,
+            )
+            return order_id
+
+        fill_price = max(round(ltp - self._slippage, 2), 0.05)
         self._orders[order_id] = {
-            "symbol": symbol,
-            "side": "SELL",
-            "qty": qty,
-            "submitted_price": price,
-            "fill_price": fill_price,
-            "spread": spread,
+            "symbol": symbol, "side": "SELL", "qty": qty,
+            "submitted_price": price, "fill_price": fill_price,
+            "ltp_at_fill": ltp, "slippage_pts": self._slippage,
             "status": OrderStatus.FILLED,
             "timestamp": datetime.now(IST).isoformat(),
             "tag": tag,
         }
         logger.info(
-            "[PAPER] SELL %s qty=%d submitted=%.2f fill=%.2f spread=%.2f tag=%s id=%s",
-            symbol, qty, price, fill_price, spread, tag, order_id,
+            "[PAPER] SELL %s qty=%d ltp=%.2f slippage=%.2f fill=%.2f tag=%s id=%s",
+            symbol, qty, ltp, self._slippage, fill_price, tag, order_id,
         )
         # Update paper positions
         pos = self._positions.get(symbol)
@@ -175,6 +241,7 @@ class PaperBroker(BrokerPort):
             avg_price=rec["fill_price"] if status == OrderStatus.FILLED else 0.0,
             filled_qty=filled,
             remaining_qty=qty - filled,
+            rejection_reason=rec.get("rejection_reason"),
         )
 
     def get_positions(self) -> list[Position]:

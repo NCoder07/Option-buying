@@ -52,8 +52,8 @@ gap_cross_policy: "enter"          # "enter" | "skip"
 # ------------------------------------------------------------------
 # Entry order
 # ------------------------------------------------------------------
-entry_limit_buffer: 0.50           # Ask + this buffer = LIMIT BUY price (₹ per unit)
-max_entry_slippage_pct: 5.0        # % over trigger; if cap blocks entry → "skipped_cap"
+entry_limit_buffer: 0.50           # LTP + this buffer = LIMIT BUY price (₹ per unit)
+max_entry_slippage_pct: 5.0        # % over trigger; if cap blocks entry → "cap_blocked"
 entry_fill_timeout_sec: 5          # Seconds to wait for fill before cancel
 entry_retry: true                  # Retry once at fresh ask after timeout
 entry_cutoff_time: "15:25:00"      # No new entries after this time (technical cutoff)
@@ -64,7 +64,7 @@ entry_cutoff_time: "15:25:00"      # No new entries after this time (technical c
 # ------------------------------------------------------------------
 sl_multiplier: 0.50                # SL = 0.50 * actual_avg_fill_price
 # SL rounding: round DOWN to tick (conservative: SL is lower, harder to hit accidentally)
-exit_limit_buffer: 0.50            # Bid - this buffer = LIMIT SELL price (₹ per unit)
+exit_limit_buffer: 0.50            # LTP - this buffer = LIMIT SELL price (₹ per unit)
 exit_fill_timeout_sec: 5           # Seconds to wait for SL fill before escalation
 use_exchange_sl: false             # false = software SL only (recommended)
 
@@ -98,9 +98,24 @@ max_daily_loss_inr: 20000          # Halt NEW entries if daily loss exceeds this
                                    # (open positions are still managed and exited)
 
 # ------------------------------------------------------------------
+# Paper mode fill simulation
+# ------------------------------------------------------------------
+# BUY fills at LTP + paper_slippage_points; SELL fills at LTP - paper_slippage_points.
+# This is a configurable assumption — 1.0 pt / side is conservative for weekly NIFTY options.
+# Documented in every journal row so forward-test results can be stress-tested.
+paper_slippage_points: 1.0
+
+# ------------------------------------------------------------------
+# Price guards (apply to all orders, live and paper)
+# ------------------------------------------------------------------
+# Order price must be within this % of LTP at the time of the order.
+# Prevents stale-price or numeric-error orders from reaching the exchange.
+order_price_sanity_pct: 10.0       # Reject if order price > LTP * (1 ± pct/100)
+
+# ------------------------------------------------------------------
 # Data freshness & safety checks
 # ------------------------------------------------------------------
-max_quote_age_sec: 10              # Reject quotes older than N seconds
+max_quote_age_sec: 10              # Reject LTP snapshots older than N seconds
 max_clock_drift_sec: 2.0           # Halt new entries if drift > this
 min_disk_free_gb: 1.0              # Halt new entries + alert below this
 heartbeat_interval_min: 5          # Ping dead-man URL every N minutes during market hours

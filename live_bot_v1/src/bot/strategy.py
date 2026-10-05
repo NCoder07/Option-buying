@@ -5,6 +5,16 @@ This module contains the complete NIFTY 50 Weekly Option Buying Strategy v1
 logic.  It is intentionally free of I/O, scheduling, and Dhan SDK imports.
 All broker calls go through BrokerPort.  All state mutations go through StateDB.
 
+Pricing model: every entry and exit price is derived from LTP.  No bid/ask.
+  - LIVE entry  : LTP + entry_limit_buffer  (rounded up to tick)
+  - LIVE exit   : LTP - exit_limit_buffer   (rounded down to tick)
+  - PAPER       : broker fills at LTP ± paper_slippage_points (PaperBroker)
+
+Price guards (apply to every order, live and paper):
+  1. LTP must be > 0 and not None, fresh within max_quote_age_sec.
+  2. Computed order price must be within order_price_sanity_pct of LTP.
+  3. PaperBroker rejects (REJECTED status) if no valid LTP at fill time.
+
 State machine per side (CE / PE), per day:
   PENDING → SELECTED (09:20 snapshot done)
           → TRIGGERED (fresh upward cross detected)
@@ -12,9 +22,6 @@ State machine per side (CE / PE), per day:
           → CLOSED (SL hit / time exit / flatten)
   Any → NO_TRADE (no eligible strike, cap blocked, etc.)
   Any → MISSED_REFERENCE (bot started late, no 09:20 reference)
-
-The strategy is STATELESS within a tick — all decisions are deterministic
-given the DailyStateRecord and PositionRecord from the DB.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from typing import Optional
 
 import pytz
 
-from .broker_port import BrokerPort, ChainRow, Fill, OrderStatus
+from .broker_port import BrokerPort, Fill, LTPSnapshot, OrderStatus
 from .state_db import DailyStateRecord, OrderRecord, PositionRecord, StateDB
 
 logger = logging.getLogger(__name__)
@@ -58,8 +65,11 @@ def _ist_time_str(dt: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Selection
+# Selection  (unchanged — uses ChainRow.ltp only)
 # ---------------------------------------------------------------------------
+
+from .broker_port import ChainRow   # noqa: E402  (local import for clarity)
+
 
 @dataclass
 class SelectionResult:
@@ -177,17 +187,59 @@ def is_fresh_cross(
 
 
 # ---------------------------------------------------------------------------
-# Entry execution
+# Price guards
 # ---------------------------------------------------------------------------
 
-def compute_entry_price(
-    ask: float,
-    config: dict,
-) -> float:
-    """Entry LIMIT price = ask + entry_limit_buffer, rounded to tick."""
+def validate_ltp(
+    snap: Optional[LTPSnapshot],
+    now: datetime,
+    max_age_sec: float,
+) -> tuple[bool, str]:
+    """
+    Validate an LTPSnapshot for use as an order reference price.
+
+    Returns (valid, reason) where reason is "" on success or a short code on failure:
+      "no_data"    — snap is None
+      "ltp_zero"   — ltp <= 0
+      "stale"      — older than max_age_sec
+    """
+    if snap is None:
+        return False, "no_data"
+    if snap.ltp <= 0:
+        return False, "ltp_zero"
+    if snap.timestamp is not None:
+        age = (now - snap.timestamp).total_seconds()
+        if age > max_age_sec:
+            return False, f"stale:{age:.1f}s"
+    return True, ""
+
+
+def order_price_within_sanity(
+    order_price: float,
+    ltp: float,
+    sanity_pct: float,
+) -> bool:
+    """
+    Return True if order_price is within sanity_pct% of ltp.
+
+    Prevents sending orders whose price has drifted wildly from the current
+    market (e.g. stale computation, numeric error, wrong tick rounding).
+    """
+    if ltp <= 0:
+        return False
+    pct_diff = abs(order_price - ltp) / ltp * 100.0
+    return pct_diff <= sanity_pct
+
+
+# ---------------------------------------------------------------------------
+# Entry / exit pricing  (LTP-based)
+# ---------------------------------------------------------------------------
+
+def compute_entry_price(ltp: float, config: dict) -> float:
+    """Entry LIMIT price = LTP + entry_limit_buffer, rounded UP to tick."""
     buf = float(config.get("entry_limit_buffer", 0.50))
     tick = float(config["tick_size"])
-    return _round_tick(ask + buf, tick)
+    return _round_tick(ltp + buf, tick)
 
 
 def entry_exceeds_slippage_cap(
@@ -201,6 +253,13 @@ def entry_exceeds_slippage_cap(
     return entry_limit_price > cap_price
 
 
+def compute_exit_price(ltp: float, config: dict, extra_buffer: float = 0.0) -> float:
+    """Exit LIMIT price = LTP - exit_limit_buffer - extra_buffer, rounded DOWN to tick."""
+    buf = float(config.get("exit_limit_buffer", 0.50))
+    tick = float(config["tick_size"])
+    return _round_tick_down(max(ltp - buf - extra_buffer, tick), tick)
+
+
 # ---------------------------------------------------------------------------
 # SL calculation
 # ---------------------------------------------------------------------------
@@ -211,7 +270,7 @@ def compute_sl(avg_fill_price: float, config: dict) -> float:
     tick = float(config["tick_size"])
     raw_sl = avg_fill_price * mult
     sl = _round_tick_down(raw_sl, tick)
-    logger.debug("compute_sl: avg_fill=%.2f * %.2f = %.4f → %.2f (rounded down)", 
+    logger.debug("compute_sl: avg_fill=%.2f * %.2f = %.4f → %.2f (rounded down)",
                  avg_fill_price, mult, raw_sl, sl)
     return sl
 
@@ -226,17 +285,6 @@ def is_sl_breached(ltp: float, sl_price: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Exit order
-# ---------------------------------------------------------------------------
-
-def compute_exit_price(bid: float, config: dict, extra_buffer: float = 0.0) -> float:
-    """Exit LIMIT price = bid - exit_limit_buffer - extra_buffer, rounded to tick."""
-    buf = float(config.get("exit_limit_buffer", 0.50))
-    tick = float(config["tick_size"])
-    return _round_tick(max(bid - buf - extra_buffer, tick), tick)
-
-
-# ---------------------------------------------------------------------------
 # Order execution helper (used by lifecycle.py)
 # ---------------------------------------------------------------------------
 
@@ -247,7 +295,9 @@ class EntryResult:
     fill: Optional[Fill]
     avg_fill_price: float
     filled_qty: int
-    event: str           # "filled" | "partial" | "timeout_cancelled" | "rejected" | "cap_blocked"
+    event: str           # "filled" | "partial" | "timeout_cancelled" | "rejected" | "cap_blocked" | "no_valid_price"
+    ltp_at_cross: float = 0.0    # LTP that triggered the cross
+    order_price_sent: float = 0.0
 
 
 def execute_entry(
@@ -255,40 +305,63 @@ def execute_entry(
     db: StateDB,
     symbol: str,
     qty: int,
-    ask: float,
+    ltp_at_cross: float,          # LTP observed when cross was detected
     trigger: float,
     config: dict,
     side: str,
     date_str: str,
-    alerts,   # Alerts instance (imported at call site)
+    alerts,
+    now: datetime,
 ) -> EntryResult:
     """
-    Place a marketable LIMIT BUY.  Handle fill timeout, one retry, partial fills.
-    Never swallows exceptions from order logic.
-    """
-    import time
+    Place a marketable LIMIT BUY priced off the current LTP.
+    Handle fill timeout, one retry (refetch LTP), partial fills.
 
-    entry_price = compute_entry_price(ask, config)
+    Price guards:
+      - LTP must be valid and fresh before sending any order.
+      - Order price must be within order_price_sanity_pct of LTP.
+      - Never sends an order without a valid LTP.
+    """
+    import time as _time
+
+    max_age = float(config.get("max_quote_age_sec", 10))
+    sanity_pct = float(config.get("order_price_sanity_pct", 10.0))
+    timeout = float(config.get("entry_fill_timeout_sec", 5))
+    tag = f"ENTRY_{side}"
+    retries = 1 if config.get("entry_retry", True) else 0
+
+    # Use the LTP from the cross observation as the initial reference
+    current_ltp = ltp_at_cross
+    entry_price = compute_entry_price(current_ltp, config)
+
+    # Sanity check order price vs current LTP
+    if not order_price_within_sanity(entry_price, current_ltp, sanity_pct):
+        logger.error(
+            "Entry price sanity check failed: entry_price=%.2f vs ltp=%.2f (sanity_pct=%.1f%%)",
+            entry_price, current_ltp, sanity_pct,
+        )
+        return EntryResult(
+            success=False, order_id=None, fill=None,
+            avg_fill_price=0.0, filled_qty=0, event="no_valid_price",
+            ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
+        )
 
     # Cap check
     if entry_exceeds_slippage_cap(entry_price, trigger, config):
         logger.warning(
             "Entry cap blocked: entry_price=%.2f > cap (trigger=%.2f, cap_pct=%.1f%%)",
-            entry_price, trigger, config.get("max_entry_slippage_pct", 5.0)
+            entry_price, trigger, config.get("max_entry_slippage_pct", 5.0),
         )
         return EntryResult(
             success=False, order_id=None, fill=None,
-            avg_fill_price=0.0, filled_qty=0, event="cap_blocked"
+            avg_fill_price=0.0, filled_qty=0, event="cap_blocked",
+            ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
         )
 
-    timeout = float(config.get("entry_fill_timeout_sec", 5))
-    tag = f"ENTRY_{side}"
-    retries = 1 if config.get("entry_retry", True) else 0
-
     for attempt in range(retries + 1):
-        t0 = time.perf_counter()
+        t0 = _time.perf_counter()
         order_id = broker.place_limit_buy(symbol, entry_price, qty, tag=tag)
-        lat = (time.perf_counter() - t0) * 1000
+        lat = (_time.perf_counter() - t0) * 1000
 
         if order_id is None:
             logger.error("place_limit_buy returned None (attempt %d)", attempt + 1)
@@ -303,10 +376,10 @@ def execute_entry(
         ))
 
         # Poll for fill
-        deadline = time.time() + timeout
+        deadline = _time.time() + timeout
         fill = None
-        while time.time() < deadline:
-            time.sleep(0.5)
+        while _time.time() < deadline:
+            _time.sleep(0.5)
             fill = broker.get_order_status(order_id)
             if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
                                OrderStatus.CANCELLED, OrderStatus.REJECTED):
@@ -326,11 +399,25 @@ def execute_entry(
         )
         db.update_order(rec)
 
+        if fill and fill.status == OrderStatus.REJECTED:
+            reason = fill.rejection_reason or "rejected"
+            if "no_valid_price" in (reason or ""):
+                event = "no_valid_price"
+            else:
+                event = "rejected"
+            logger.error("Entry rejected: %s", reason)
+            return EntryResult(
+                success=False, order_id=order_id, fill=fill,
+                avg_fill_price=0.0, filled_qty=0, event=event,
+                ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
+            )
+
         if fill and fill.status == OrderStatus.FILLED:
             return EntryResult(
                 success=True, order_id=order_id, fill=fill,
                 avg_fill_price=fill.avg_price,
                 filled_qty=fill.filled_qty, event="filled",
+                ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
             )
 
         if fill and fill.status == OrderStatus.PARTIALLY_FILLED and fill.filled_qty > 0:
@@ -339,38 +426,48 @@ def execute_entry(
                 success=True, order_id=order_id, fill=fill,
                 avg_fill_price=fill.avg_price,
                 filled_qty=fill.filled_qty, event="partial",
+                ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
             )
 
-        # Timeout or rejection — cancel if still pending
+        # Timeout — cancel if still pending
         if fill and fill.status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
             broker.cancel_order(order_id)
             logger.warning("Entry order %s not filled within %.1fs — cancelled (attempt %d)",
                            order_id, timeout, attempt + 1)
 
-        if fill and fill.status == OrderStatus.REJECTED:
-            logger.error("Entry rejected: %s", fill.rejection_reason)
-            return EntryResult(
-                success=False, order_id=order_id, fill=fill,
-                avg_fill_price=0.0, filled_qty=0, event="rejected",
-            )
-
-        # Retry with fresh ask
+        # Retry with fresh LTP
         if attempt < retries:
-            new_quote = broker.get_quote(symbol)
-            if new_quote:
-                ask = new_quote.ask
-                entry_price = compute_entry_price(ask, config)
-                logger.info("Retrying entry at fresh ask=%.2f entry_price=%.2f", ask, entry_price)
-                if entry_exceeds_slippage_cap(entry_price, trigger, config):
-                    logger.warning("Retry also cap-blocked — giving up")
-                    return EntryResult(
-                        success=False, order_id=order_id, fill=fill,
-                        avg_fill_price=0.0, filled_qty=0, event="cap_blocked",
-                    )
+            fresh_snap = broker.get_ltp_single(symbol)
+            valid, reason = validate_ltp(fresh_snap, _now_ist(), max_age)
+            if not valid:
+                logger.warning("Retry aborted: no valid LTP for %s (%s)", symbol, reason)
+                return EntryResult(
+                    success=False, order_id=order_id, fill=fill,
+                    avg_fill_price=0.0, filled_qty=0, event="no_valid_price",
+                    ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
+                )
+            current_ltp = fresh_snap.ltp
+            entry_price = compute_entry_price(current_ltp, config)
+            logger.info("Retrying entry at fresh ltp=%.2f entry_price=%.2f", current_ltp, entry_price)
+            if not order_price_within_sanity(entry_price, current_ltp, sanity_pct):
+                logger.warning("Retry price sanity check failed — giving up")
+                return EntryResult(
+                    success=False, order_id=order_id, fill=fill,
+                    avg_fill_price=0.0, filled_qty=0, event="no_valid_price",
+                    ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
+                )
+            if entry_exceeds_slippage_cap(entry_price, trigger, config):
+                logger.warning("Retry also cap-blocked — giving up")
+                return EntryResult(
+                    success=False, order_id=order_id, fill=fill,
+                    avg_fill_price=0.0, filled_qty=0, event="cap_blocked",
+                    ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
+                )
 
     return EntryResult(
         success=False, order_id=None, fill=None,
         avg_fill_price=0.0, filled_qty=0, event="timeout_cancelled",
+        ltp_at_cross=ltp_at_cross, order_price_sent=entry_price,
     )
 
 
@@ -381,26 +478,40 @@ def execute_exit(
     reason: str,
     config: dict,
     date_str: str,
-    bid: float,
+    ltp_at_exit: float,       # LTP at the moment exit was decided
+    now: datetime,
 ) -> Optional[str]:
     """
-    Place a marketable LIMIT SELL.  Escalate with wider bids if not filled.
+    Place a marketable LIMIT SELL priced off LTP.
+    Escalate with wider buffers if not filled (reprice from fresh LTP each retry).
     NEVER leaves position open — retries until flat, then alerts.
     Returns final order_id or None if all retries exhausted (ALERT!).
     """
-    import time
+    import time as _time
 
+    max_age = float(config.get("max_quote_age_sec", 10))
+    sanity_pct = float(config.get("order_price_sanity_pct", 10.0))
     max_retries = int(config.get("exit_escalation_max_retries", 5))
     timeout = float(config.get("exit_fill_timeout_sec", 5))
     extra_buf = 0.0
     tag = f"EXIT_{pos.side}_{reason[:6]}"
     qty = pos.qty
+    current_ltp = ltp_at_exit
 
     for attempt in range(max_retries + 1):
-        exit_price = compute_exit_price(bid, config, extra_buffer=extra_buf)
-        t0 = time.perf_counter()
+        exit_price = compute_exit_price(current_ltp, config, extra_buffer=extra_buf)
+
+        if not order_price_within_sanity(exit_price, current_ltp, sanity_pct):
+            logger.warning(
+                "Exit price sanity check failed: exit_price=%.2f vs ltp=%.2f — widening",
+                exit_price, current_ltp,
+            )
+            # Sanity failure on exit: fall back to exactly ltp (no buffer) to avoid no-fill loop
+            exit_price = _round_tick_down(current_ltp, float(config["tick_size"]))
+
+        t0 = _time.perf_counter()
         order_id = broker.place_limit_sell(pos.symbol, exit_price, qty, tag=tag)
-        lat = (time.perf_counter() - t0) * 1000
+        lat = (_time.perf_counter() - t0) * 1000
 
         if order_id is None:
             logger.error("place_limit_sell returned None (attempt %d)", attempt + 1)
@@ -414,10 +525,10 @@ def execute_exit(
             sent_at=_ist_time_str(_now_ist()), latency_ms=lat,
         ))
 
-        deadline = time.time() + timeout
+        deadline = _time.time() + timeout
         fill = None
-        while time.time() < deadline:
-            time.sleep(0.5)
+        while _time.time() < deadline:
+            _time.sleep(0.5)
             fill = broker.get_order_status(order_id)
             if fill.status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED,
                                OrderStatus.CANCELLED, OrderStatus.REJECTED):
@@ -446,15 +557,23 @@ def execute_exit(
             if qty <= 0:
                 return order_id
 
-        # Widen buffer for next attempt
+        # Widen buffer and get fresh LTP for next attempt
         if fill and fill.status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED):
             broker.cancel_order(order_id)
         extra_buf += float(config.get("exit_escalation_additional_buffer", 0.50))
-        bid_q = broker.get_quote(pos.symbol)
-        if bid_q:
-            bid = bid_q.bid
-        logger.warning("Exit order %s not filled — retrying with wider buffer=%.2f (attempt %d)",
-                       order_id, extra_buf, attempt + 2)
+
+        fresh_snap = broker.get_ltp_single(pos.symbol)
+        valid, ltp_reason = validate_ltp(fresh_snap, _now_ist(), max_age)
+        if valid and fresh_snap is not None:
+            current_ltp = fresh_snap.ltp
+        else:
+            logger.warning("Exit retry: no fresh LTP for %s (%s) — using last known %.2f",
+                           pos.symbol, ltp_reason, current_ltp)
+
+        logger.warning(
+            "Exit order %s not filled — retrying ltp=%.2f buffer=%.2f (attempt %d)",
+            order_id, current_ltp, extra_buf, attempt + 2,
+        )
 
     logger.critical(
         "FATAL: could not exit position %s after %d attempts! Manual intervention required.",

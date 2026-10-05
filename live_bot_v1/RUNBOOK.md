@@ -322,6 +322,8 @@ The deploy script: stops service → git pull → pip install → runs tests →
 
 | Item | Detail |
 |---|---|
+| **Entry/exit priced off LTP** | Entry priced at LTP + `entry_limit_buffer`; exit at LTP − `exit_limit_buffer`. No bid/ask or market depth is read for any decision. Paper fills use LTP ± `paper_slippage_points` (configurable, default 1.0 pt/side). This is a stated assumption documented in every journal row. |
+| **Paper slippage assumption** | `paper_slippage_points: 1.0` in config. This is conservative for weekly NIFTY options. Adjust to match observed live fills after the first paper-to-live comparison. |
 | **Entry cutoff** | Spec has no explicit cutoff. Bot defaults to `entry_cutoff_time: "15:25:00"`. Entries after 15:00 are flagged `late_entry` in journal. |
 | **WebSocket** | Phase 1 uses REST polling (~1 Hz). MarketFeed WS is available in dhanhq and can be wired in a future PR without changing strategy logic. |
 | **Exchange SL** | `use_exchange_sl: false` (default). Exchange SL orders would need re-arming each morning (DAY orders expire); this adds complexity and dual-fire risk. Software SL is preferred. |

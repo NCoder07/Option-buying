@@ -7,7 +7,8 @@ Covers:
   - Fresh cross vs already-above vs gap-cross
   - SL calculation
   - Entry cap check
-  - Entry/exit price rounding
+  - Entry/exit price rounding (LTP-based — no bid/ask)
+  - Price guard functions: validate_ltp, order_price_within_sanity
   - Timezone correctness
 """
 
@@ -25,10 +26,12 @@ from bot.strategy import (
     compute_entry_price,
     compute_exit_price,
     entry_exceeds_slippage_cap,
+    validate_ltp,
+    order_price_within_sanity,
     _round_tick,
     _round_tick_down,
 )
-from bot.broker_port import ChainRow
+from bot.broker_port import ChainRow, LTPSnapshot
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -47,6 +50,8 @@ _BASE_CONFIG = {
     "max_entry_slippage_pct": 5.0,
     "sl_multiplier": 0.50,
     "exit_limit_buffer": 0.50,
+    "order_price_sanity_pct": 10.0,
+    "max_quote_age_sec": 10,
 }
 
 
@@ -55,7 +60,7 @@ def _chain(strikes: list[tuple[int, float, str]]) -> list[ChainRow]:
     return [
         ChainRow(
             strike=s, option_type=opt, symbol=f"NIFTY 12JUN25 {s} {opt}",
-            ltp=ltp, bid=ltp - 0.10, ask=ltp + 0.10,
+            ltp=ltp,
         )
         for s, ltp, opt in strikes
     ]
@@ -238,11 +243,12 @@ class TestSLCalculation:
 
 
 # ---------------------------------------------------------------------------
-# Entry/exit price
+# Entry/exit price — LTP-based (no bid/ask)
 # ---------------------------------------------------------------------------
 
 class TestPricing:
-    def test_entry_price_ask_plus_buffer(self):
+    def test_entry_price_ltp_plus_buffer(self):
+        # LTP=93.50, buffer=0.50 → 94.00
         price = compute_entry_price(93.5, _BASE_CONFIG)
         assert price == pytest.approx(94.0, abs=0.01)
 
@@ -260,13 +266,69 @@ class TestPricing:
         blocked = entry_exceeds_slippage_cap(94.0, 93.0, _BASE_CONFIG)
         assert blocked is False
 
-    def test_exit_price_bid_minus_buffer(self):
+    def test_exit_price_ltp_minus_buffer(self):
+        # LTP=93.50, buffer=0.50 → 93.00
         price = compute_exit_price(93.5, _BASE_CONFIG)
         assert price == pytest.approx(93.0, abs=0.01)
 
     def test_exit_price_with_extra_buffer(self):
         price = compute_exit_price(93.5, _BASE_CONFIG, extra_buffer=0.5)
         assert price == pytest.approx(92.5, abs=0.01)
+
+    def test_exit_price_rounds_down_to_tick(self):
+        # LTP=93.47, buffer=0.50 → 92.97 → round DOWN → 92.95
+        price = compute_exit_price(93.47, _BASE_CONFIG)
+        from decimal import Decimal
+        assert Decimal(str(price)) % Decimal("0.05") == Decimal("0")
+        assert price <= 92.97
+
+
+# ---------------------------------------------------------------------------
+# Price guards
+# ---------------------------------------------------------------------------
+
+class TestPriceGuards:
+    def test_validate_ltp_none_snap(self):
+        now = IST.localize(datetime(2025, 6, 12, 10, 0, 0))
+        valid, reason = validate_ltp(None, now, 10.0)
+        assert valid is False
+        assert reason == "no_data"
+
+    def test_validate_ltp_zero(self):
+        now = IST.localize(datetime(2025, 6, 12, 10, 0, 0))
+        snap = LTPSnapshot("SYM", ltp=0.0, timestamp=now)
+        valid, reason = validate_ltp(snap, now, 10.0)
+        assert valid is False
+        assert reason == "ltp_zero"
+
+    def test_validate_ltp_stale(self):
+        import pytz
+        from datetime import timedelta
+        now = IST.localize(datetime(2025, 6, 12, 10, 0, 30))
+        old_ts = IST.localize(datetime(2025, 6, 12, 10, 0, 0))  # 30s ago
+        snap = LTPSnapshot("SYM", ltp=93.0, timestamp=old_ts)
+        valid, reason = validate_ltp(snap, now, max_age_sec=10.0)
+        assert valid is False
+        assert "stale" in reason
+
+    def test_validate_ltp_fresh(self):
+        now = IST.localize(datetime(2025, 6, 12, 10, 0, 5))
+        snap = LTPSnapshot("SYM", ltp=93.0, timestamp=now)
+        valid, reason = validate_ltp(snap, now, max_age_sec=10.0)
+        assert valid is True
+        assert reason == ""
+
+    def test_order_price_within_sanity_pass(self):
+        # order_price=94.0, ltp=93.0, sanity=10% → 7% off → OK
+        assert order_price_within_sanity(94.0, 93.0, 10.0) is True
+
+    def test_order_price_within_sanity_fail(self):
+        # order_price=0.50, ltp=93.50, sanity=10% → wildly off → FAIL
+        # This is the exact scenario from the ₹0.50 fill bug
+        assert order_price_within_sanity(0.50, 93.50, 10.0) is False
+
+    def test_order_price_within_sanity_zero_ltp(self):
+        assert order_price_within_sanity(0.50, 0.0, 10.0) is False
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from bot.broker_port import BrokerPort, ChainRow, Fill, OrderStatus, Position, Quote
+from bot.broker_port import BrokerPort, ChainRow, Fill, OrderStatus, Position
 from bot.lifecycle import reconcile
 from bot.state_db import StateDB, PositionRecord
 
@@ -51,7 +51,7 @@ class StubBroker(BrokerPort):
 
     # Unused stubs
     def get_ltp(self, symbols): return {}
-    def get_quote(self, symbol): return None
+    def get_ltp_single(self, symbol): return None
     def get_option_chain_snapshot(self, expiry_date, num_strikes=20): return []
     def get_expiry_list(self): return []
     def place_limit_buy(self, symbol, price, qty, tag=None): return None

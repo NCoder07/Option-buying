@@ -13,9 +13,11 @@ Implements the full trading day state machine:
   next day 09:15 → repeat
 
 The bot uses a 1-second polling loop.  WebSocket integration can replace
-the polling calls by updating a shared quote cache from a background thread.
+the polling calls by updating a shared LTP cache from a background thread.
 
 All time comparisons are tz-aware Asia/Kolkata datetimes.
+All log timestamps include the IST UTC offset (+05:30) so the log is
+unambiguous when replayed from a VM not set to IST.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ import pytz
 import yaml
 
 from .alerts import Alerts
-from .broker_port import BrokerPort, Fill, OrderStatus
+from .broker_port import BrokerPort, Fill, LTPSnapshot, OrderStatus
 from .calendar import is_expiry_today, is_trading_day, select_expiry, today_ist, dte
 from .clock_guard import ClockGuard
 from .ip_guard import IPGuard
@@ -50,6 +52,7 @@ from .strategy import (
     is_fresh_cross,
     is_sl_breached,
     select_strike,
+    validate_ltp,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +65,7 @@ SIDES = ["CE", "PE"]
 # ---------------------------------------------------------------------------
 
 def _now_ist() -> datetime:
+    """Return current time as tz-aware IST datetime (offset +05:30 explicit)."""
     return datetime.now(IST)
 
 
@@ -285,26 +289,29 @@ class DayLifecycle:
     def on_tick_overnight(self, now: datetime) -> None:
         """
         09:15–09:25: Monitor overnight positions from the opening tick.
-        Check SL on every tick.  Record gap info (prior close vs first tick).
+        Check SL on every tick using LTP.
         """
+        max_age = float(self._cfg.get("max_quote_age_sec", 10))
         for side in SIDES:
             pos = self._open_positions.get(side)
             if pos is None or pos.status != "OPEN":
                 continue
-            quote = self._broker.get_quote(pos.symbol)
-            if quote is None:
+            snap = self._broker.get_ltp_single(pos.symbol)
+            valid, reason = validate_ltp(snap, now, max_age)
+            if not valid:
+                logger.warning("overnight_monitor: no valid LTP for %s (%s)", pos.symbol, reason)
                 continue
-            ltp = quote.ltp
+            ltp = snap.ltp
             # Record tick data
             self._journal.write_tick(
-                self._today_str, pos.symbol, ltp, quote.bid, quote.ask,
-                event="overnight_monitor",
+                self._today_str, pos.symbol, ltp, event="overnight_monitor",
             )
             # SL check
             if is_sl_breached(ltp, pos.sl_price):
-                logger.warning("OVERNIGHT SL HIT: %s LTP=%.2f SL=%.2f", pos.symbol, ltp, pos.sl_price)
+                logger.warning("OVERNIGHT SL HIT: %s LTP=%.2f SL=%.2f",
+                               pos.symbol, ltp, pos.sl_price)
                 self._alerts.sl_hit(side, pos.symbol, ltp, pos.sl_price)
-                self._exit_position(pos, side, "sl_overnight", quote.bid, now)
+                self._exit_position(pos, side, "sl_overnight", ltp, now)
 
     # ------------------------------------------------------------------
     # 09:20 — Snapshot and selection
@@ -313,11 +320,16 @@ class DayLifecycle:
     def on_selection_time(self, now: datetime) -> None:
         """
         09:20: Take option chain snapshot, select CE and PE strikes, set triggers.
+        Logs request time, receipt time, and per-price ages.
         """
-        logger.info("09:20 selection snapshot (expiry=%s)", self._expiry)
+        logger.info("09:20 selection snapshot (expiry=%s) request_time=%s",
+                    self._expiry, now.isoformat())
         t0 = time.perf_counter()
         chain = self._broker.get_option_chain_snapshot(self._expiry, num_strikes=20)
+        receipt_time = _now_ist()
         lat = (time.perf_counter() - t0) * 1000
+        logger.info("09:20 snapshot received: rows=%d request_latency_ms=%.0f receipt_time=%s",
+                    len(chain), lat, receipt_time.isoformat())
 
         self._journal.write_chain_snapshot(self._today_str, chain, now.isoformat())
 
@@ -392,6 +404,7 @@ class DayLifecycle:
 
     def on_exit_time(self, now: datetime) -> None:
         """09:25: exit any overnight position that hasn't been stopped yet."""
+        max_age = float(self._cfg.get("max_quote_age_sec", 10))
         for side in SIDES:
             pos = self._open_positions.get(side)
             if pos is None or pos.status != "OPEN":
@@ -400,9 +413,12 @@ class DayLifecycle:
             if pos.date == self._today_str:
                 continue  # today's position, not yet time exit
             logger.info("TIME EXIT (09:25): %s %s", side, pos.symbol)
-            quote = self._broker.get_quote(pos.symbol)
-            bid = quote.bid if quote else 0
-            self._exit_position(pos, side, "time_exit_0925", bid, now)
+            snap = self._broker.get_ltp_single(pos.symbol)
+            valid, reason = validate_ltp(snap, now, max_age)
+            ltp = snap.ltp if valid and snap else pos.sl_price  # fallback: last known SL level
+            if not valid:
+                logger.warning("time_exit: no fresh LTP for %s (%s) — using sl_price as ltp", pos.symbol, reason)
+            self._exit_position(pos, side, "time_exit_0925", ltp, now)
 
     # ------------------------------------------------------------------
     # Intraday polling loop (09:20 → 15:25)
@@ -412,9 +428,9 @@ class DayLifecycle:
         """
         Called ~1 Hz from 09:20 onwards.
         Monitors selected options for fresh trigger cross and SL on open positions.
+        All prices come from LTP.
         """
-        h_mm, m = now.hour, now.minute
-        ts_str = now.isoformat()
+        max_age = float(self._cfg.get("max_quote_age_sec", 10))
         date_str = self._today_str
 
         for side in SIDES:
@@ -425,17 +441,18 @@ class DayLifecycle:
                 # Monitor SL on open position
                 pos = self._open_positions.get(side)
                 if pos and pos.status == "OPEN":
-                    quote = self._broker.get_quote(pos.symbol)
-                    if quote is None:
+                    snap = self._broker.get_ltp_single(pos.symbol)
+                    valid, reason = validate_ltp(snap, now, max_age)
+                    if not valid:
+                        logger.warning("sl_monitor: no valid LTP for %s (%s)", pos.symbol, reason)
                         continue
-                    ltp = quote.ltp
+                    ltp = snap.ltp
                     self._journal.write_tick(
-                        date_str, pos.symbol, ltp, quote.bid, quote.ask,
-                        event="sl_monitor",
+                        date_str, pos.symbol, ltp, event="sl_monitor",
                     )
                     if is_sl_breached(ltp, pos.sl_price):
                         self._alerts.sl_hit(side, pos.symbol, ltp, pos.sl_price)
-                        self._exit_position(pos, side, "sl_intraday", quote.bid, now)
+                        self._exit_position(pos, side, "sl_intraday", ltp, now)
                 continue
 
             if not self._reference_established[side]:
@@ -446,23 +463,17 @@ class DayLifecycle:
             if (now.hour, now.minute, now.second) >= cutoff:
                 continue
 
-            # Poll LTP/quote
-            quote = self._broker.get_quote(sel.symbol)
-            if quote is None:
+            # Poll LTP
+            snap = self._broker.get_ltp_single(sel.symbol)
+            valid, reason = validate_ltp(snap, now, max_age)
+            if not valid:
+                logger.warning("cross_monitor: no valid LTP for %s (%s) — skipping tick",
+                               sel.symbol, reason)
                 continue
-            ltp = quote.ltp
-
-            # Data freshness check
-            max_age = float(self._cfg.get("max_quote_age_sec", 10))
-            if quote.timestamp:
-                age = (now - quote.timestamp).total_seconds()
-                if age > max_age:
-                    logger.warning("Stale quote for %s (age=%.1fs)", sel.symbol, age)
-                    continue
+            ltp = snap.ltp
 
             self._journal.write_tick(
-                date_str, sel.symbol, ltp, quote.bid, quote.ask,
-                event="cross_monitor",
+                date_str, sel.symbol, ltp, event="cross_monitor",
             )
 
             # Fresh cross detection
@@ -481,8 +492,7 @@ class DayLifecycle:
                     self._cfg.get("gap_cross_policy", "enter"),
                 )
                 self._journal.write_tick(
-                    date_str, sel.symbol, ltp, quote.bid, quote.ask,
-                    event=event_type,
+                    date_str, sel.symbol, ltp, event=event_type,
                 )
 
             if not should_enter:
@@ -526,8 +536,7 @@ class DayLifecycle:
                 side, ltp, sel.trigger,
             )
             self._journal.write_tick(
-                date_str, sel.symbol, ltp, quote.bid, quote.ask,
-                event=f"trigger_cross_{event_type}",
+                date_str, sel.symbol, ltp, event=f"trigger_cross_{event_type}",
             )
 
             daily = self._db.get_or_create_daily_state(date_str, side)
@@ -540,20 +549,21 @@ class DayLifecycle:
                 db=self._db,
                 symbol=sel.symbol,
                 qty=qty,
-                ask=quote.ask,
+                ltp_at_cross=ltp,
                 trigger=sel.trigger,
                 config=self._cfg,
                 side=side,
                 date_str=date_str,
                 alerts=self._alerts,
+                now=now,
             )
 
             self._risk.record_order_sent()
 
-            if result.event == "cap_blocked":
-                self._alerts.entry_skipped(side, "slippage_cap_blocked")
+            if result.event in ("cap_blocked", "no_valid_price"):
+                self._alerts.entry_skipped(side, result.event)
                 daily.status = "NO_TRADE"
-                daily.no_trade_reason = "slippage_cap_blocked"
+                daily.no_trade_reason = result.event
                 self._db.update_daily_state(daily)
                 self._entry_done[side] = True
                 continue
@@ -572,6 +582,11 @@ class DayLifecycle:
             sl_price = compute_sl(avg_fill, self._cfg)
             actual_qty = result.filled_qty
 
+            logger.info(
+                "ENTERED %s: symbol=%s qty=%d avg_fill=%.2f SL=%.2f",
+                side, sel.symbol, actual_qty, avg_fill, sl_price,
+            )
+
             # Save position to DB
             pos_rec = PositionRecord(
                 date=date_str, side=side, symbol=sel.symbol,
@@ -582,15 +597,17 @@ class DayLifecycle:
                 status="OPEN",
                 extra={
                     "p0": sel.p0, "trigger": sel.trigger,
+                    "ltp_at_cross": result.ltp_at_cross,
+                    "prev_ltp_before_cross": self._prev_ltp[side],
+                    "order_price_sent": result.order_price_sent,
                     "event_type": event_type,
                     "flag_gap_cross": event_type == "gap_cross",
                     "flag_partial_fill": result.event == "partial",
                     "flag_late_entry": is_late,
-                    "bid_at_cross": quote.bid,
-                    "ask_at_cross": quote.ask,
                     "cross_time": t_cross,
                     "lot_size": lot_size,
                     "lots": lots,
+                    "paper_slippage_points": self._cfg.get("paper_slippage_points", 1.0),
                 },
             )
             pos_id = self._db.upsert_position(pos_rec)
@@ -602,10 +619,6 @@ class DayLifecycle:
             self._db.update_daily_state(daily)
 
             self._alerts.entry(side, sel.symbol, actual_qty, avg_fill, sl_price)
-            logger.info(
-                "ENTERED %s: symbol=%s qty=%d avg_fill=%.2f SL=%.2f",
-                side, sel.symbol, actual_qty, avg_fill, sl_price,
-            )
 
     # ------------------------------------------------------------------
     # 15:35 — End of day
@@ -659,7 +672,7 @@ class DayLifecycle:
         pos: PositionRecord,
         side: str,
         reason: str,
-        bid: float,
+        ltp_at_exit: float,
         now: datetime,
     ) -> None:
         """Place exit order, record fill, update DB and journal."""
@@ -673,7 +686,8 @@ class DayLifecycle:
             reason=reason,
             config=self._cfg,
             date_str=self._today_str,
-            bid=bid,
+            ltp_at_exit=ltp_at_exit,
+            now=now,
         )
         if order_id is None:
             self._alerts.exit_failed(side, pos.symbol)
@@ -681,7 +695,7 @@ class DayLifecycle:
 
         # Get fill price
         fill = self._broker.get_order_status(order_id)
-        exit_price = fill.avg_price if fill.avg_price > 0 else bid
+        exit_price = fill.avg_price if fill.avg_price > 0 else ltp_at_exit
 
         lot_size = self._lot_sizes.get(pos.symbol, 75)
         pnl_pts, pnl_inr = compute_pnl(
@@ -699,6 +713,28 @@ class DayLifecycle:
         self._alerts.exit_done(side, pos.symbol, reason, exit_price, pnl_pts, pnl_inr)
 
         extra = pos.extra or {}
+        ltp_at_cross = extra.get("ltp_at_cross") or pos.avg_fill_price
+        order_price_sent = extra.get("order_price_sent") or pos.avg_fill_price
+
+        # Fill-price sanity assert: reject obviously wrong fills
+        sanity_pct = float(self._cfg.get("order_price_sanity_pct", 10.0))
+        flag_invalid_price = False
+        if pos.avg_fill_price > 0 and ltp_at_cross > 0:
+            entry_drift_pct = abs(pos.avg_fill_price - ltp_at_cross) / ltp_at_cross * 100
+            if entry_drift_pct > sanity_pct:
+                flag_invalid_price = True
+                logger.error(
+                    "INVALID FILL DETECTED: avg_fill=%.2f vs ltp_at_cross=%.2f "
+                    "(drift=%.1f%% > %.1f%%) — trade marked invalid_price",
+                    pos.avg_fill_price, ltp_at_cross, entry_drift_pct, sanity_pct,
+                )
+                self._alerts.send(
+                    f"INVALID FILL: {pos.symbol} avg_fill={pos.avg_fill_price:.2f} "
+                    f"vs ltp_at_cross={ltp_at_cross:.2f} "
+                    f"(drift={entry_drift_pct:.1f}%) — investigate immediately",
+                    level="ERROR",
+                )
+
         self._journal.write_trade({
             "date": pos.date,
             "side": side,
@@ -708,19 +744,29 @@ class DayLifecycle:
             "symbol": pos.symbol,
             "p0": extra.get("p0"),
             "trigger": extra.get("trigger"),
-            "reference_ts": None,
+            "reference_ts": extra.get("cross_time"),
+            "reference_latency_ms": None,
+            "ltp_at_cross": ltp_at_cross,
+            "prev_ltp_before_cross": extra.get("prev_ltp_before_cross"),
             "cross_detected_time": extra.get("cross_time"),
-            "bid_at_cross": extra.get("bid_at_cross"),
-            "ask_at_cross": extra.get("ask_at_cross"),
+            "order_sent_time": pos.entry_time,
+            "order_price_sent": order_price_sent,
             "fill_time": pos.entry_time,
             "avg_fill_price": pos.avg_fill_price,
-            "entry_slippage_vs_ask": round(pos.avg_fill_price - (extra.get("ask_at_cross") or pos.avg_fill_price), 2),
-            "entry_slippage_vs_trigger": round(pos.avg_fill_price - (extra.get("trigger") or pos.avg_fill_price), 2),
+            "entry_slippage_vs_trigger": round(
+                pos.avg_fill_price - (extra.get("trigger") or pos.avg_fill_price), 2
+            ),
+            "entry_slippage_vs_ltp_at_cross": round(
+                pos.avg_fill_price - ltp_at_cross, 2
+            ),
             "sl_price": pos.sl_price,
+            "paper_slippage_points": extra.get("paper_slippage_points"),
             "exit_reason": reason,
+            "exit_order_time": now.isoformat(),
             "exit_fill_time": now.isoformat(),
             "exit_fill_price": exit_price,
-            "exit_slippage_vs_bid": round(bid - exit_price, 2),
+            "exit_slippage_vs_ltp_at_exit": round(ltp_at_exit - exit_price, 2),
+            "exit_slippage_vs_sl": round(exit_price - pos.sl_price, 2),
             "gap_through_stop": reason in ("sl_overnight",),
             "pnl_points": pnl_pts,
             "pnl_inr": pnl_inr,
@@ -731,6 +777,7 @@ class DayLifecycle:
             "flag_partial_fill": extra.get("flag_partial_fill", False),
             "flag_late_entry": extra.get("flag_late_entry", False),
             "flag_retries": extra.get("retries", 0),
+            "flag_invalid_price": flag_invalid_price,
             "mode": self._mode,
         })
         logger.info("Position closed: %s %s reason=%s pnl_pts=%.2f",
@@ -744,13 +791,15 @@ class DayLifecycle:
         """
         Square off all open positions.  Called by botctl flatten with user confirmation.
         """
+        max_age = float(self._cfg.get("max_quote_age_sec", 10))
         logger.warning("FLATTEN: squaring off all open positions")
         for side in SIDES:
             pos = self._open_positions.get(side)
             if pos and pos.status == "OPEN":
-                quote = self._broker.get_quote(pos.symbol)
-                bid = quote.bid if quote else 0
-                self._exit_position(pos, side, "flatten", bid, now)
+                snap = self._broker.get_ltp_single(pos.symbol)
+                valid, reason = validate_ltp(snap, now, max_age)
+                ltp = snap.ltp if valid and snap else pos.sl_price
+                self._exit_position(pos, side, "flatten", ltp, now)
 
     # ------------------------------------------------------------------
     # Status snapshot (for botctl status)
@@ -820,6 +869,7 @@ def run_bot(
     exit_h, exit_m, _ = _parse_time(config.get("exit_time", "09:25:00"))
     cutoff_h, cutoff_m, _ = _parse_time(config.get("entry_cutoff_time", "15:25:00"))
     eod_h, eod_m, _ = _parse_time(config.get("eod_summary_time", "15:40:00"))
+    heartbeat_log_sec = int(heartbeat_min * 60)
 
     # Phase flags for the current day
     morning_done = False
@@ -827,6 +877,7 @@ def run_bot(
     exit_time_done = False
     eod_done = False
     last_date = None
+    last_heartbeat_log: Optional[datetime] = None
 
     day = None
 
@@ -899,6 +950,12 @@ def run_bot(
         if morning_done and selection_done and (h, m) >= (sel_h, sel_m) and (h, m) < (cutoff_h, cutoff_m + 1):
             day.on_tick_intraday(now)
 
+        # --- Heartbeat log (every N minutes during market hours): log selected LTPs ---
+        if morning_done and selection_done and (h, m) >= (sel_h, sel_m) and (h, m) < (eod_h, eod_m):
+            if last_heartbeat_log is None or (now - last_heartbeat_log).total_seconds() >= heartbeat_log_sec:
+                last_heartbeat_log = now
+                _log_heartbeat_ltps(day, broker, config)
+
         # --- EOD ---
         if morning_done and not eod_done and (h, m) >= (eod_h, eod_m):
             day.on_eod(now)
@@ -908,3 +965,26 @@ def run_bot(
 
     journal.close()
     logger.info("Bot main loop exited gracefully")
+
+
+def _log_heartbeat_ltps(day: DayLifecycle, broker: BrokerPort, config: dict) -> None:
+    """
+    Log a heartbeat line with the current LTP for each selected contract.
+    Called every heartbeat_interval_min minutes during market hours.
+    """
+    max_age = float(config.get("max_quote_age_sec", 10))
+    parts = []
+    for side in SIDES:
+        sel = day._selections.get(side)
+        if sel is None:
+            parts.append(f"{side}=no_selection")
+            continue
+        snap = broker.get_ltp_single(sel.symbol)
+        valid, reason = validate_ltp(snap, _now_ist(), max_age)
+        if valid and snap:
+            pos = day._open_positions.get(side)
+            sl_str = f" SL={pos.sl_price:.2f}" if pos and pos.status == "OPEN" else ""
+            parts.append(f"{side}={snap.ltp:.2f}(trig={sel.trigger:.2f}{sl_str})")
+        else:
+            parts.append(f"{side}=no_ltp({reason})")
+    logger.info("HEARTBEAT %s | %s", _now_ist().isoformat(), " | ".join(parts))

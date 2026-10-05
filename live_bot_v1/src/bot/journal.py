@@ -9,6 +9,11 @@ Also writes structured JSON-lines tick data to data/YYYY-MM-DD/.
 
 All paths relative to the DATA_DIR passed at construction.
 Headers are written only once (first row); subsequent runs append.
+
+Pricing model: all slippage metrics are LTP-based.  No bid/ask.
+Fill-price sanity: write_trade asserts that fill price is within
+order_price_sanity_pct of ltp_at_cross.  Trades that fail are flagged
+flag_invalid_price=True (NOT silently dropped — they are still written).
 """
 
 from __future__ import annotations
@@ -27,27 +32,39 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
 # ---------------------------------------------------------------------------
-# Trade journal schema (one row per trade, comparable to backtest trades.csv)
+# Trade journal schema (one row per trade)
 # ---------------------------------------------------------------------------
 
 TRADE_FIELDS = [
     "date", "side", "expiry", "dte", "strike", "symbol",
     "p0", "trigger",
+    # Cross and reference timing
     "reference_ts", "reference_latency_ms",
-    "cross_detected_time", "bid_at_cross", "ask_at_cross",
-    "order_sent_time", "fill_time",
-    "avg_fill_price",
-    "entry_slippage_vs_ask", "entry_slippage_vs_trigger",
+    "ltp_at_cross",                  # LTP observed when trigger was crossed
+    "prev_ltp_before_cross",         # LTP in the tick immediately before the cross
+    "cross_detected_time",
+    # Order and fill
+    "order_sent_time", "order_price_sent",
+    "fill_time", "avg_fill_price",
+    "entry_slippage_vs_trigger",     # avg_fill - trigger
+    "entry_slippage_vs_ltp_at_cross",# avg_fill - ltp_at_cross
     "sl_price",
+    "paper_slippage_points",         # assumption used in paper mode (None in live)
+    # Exit
     "exit_reason",
     "exit_order_time", "exit_fill_time",
     "exit_fill_price",
-    "exit_slippage_vs_bid", "exit_slippage_vs_sl",
+    "exit_slippage_vs_ltp_at_exit",  # ltp_at_exit_decision - exit_fill
+    "exit_slippage_vs_sl",           # exit_fill - sl_price
     "gap_through_stop",
+    # P&L
     "pnl_points", "pnl_inr",
+    # Sizing
     "lots", "lot_size", "qty",
+    # Flags
     "flag_gap_cross", "flag_skipped_cap", "flag_late_entry",
-    "flag_partial_fill", "flag_retries",
+    "flag_partial_fill", "flag_retries", "flag_invalid_price",
+    # Meta
     "code_version", "config_hash",
     "mode",
 ]
@@ -62,8 +79,7 @@ DAILY_FIELDS = [
 ]
 
 TICK_FIELDS = [
-    "ts", "symbol", "ltp", "bid", "ask", "bid_qty", "ask_qty",
-    "event",
+    "ts", "symbol", "ltp", "event",
 ]
 
 
@@ -100,7 +116,7 @@ class Journal:
             w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
             w.writerow(row)
         logger.info("JOURNAL trade: %s", {k: row.get(k) for k in
-                    ["date", "side", "strike", "pnl_points", "exit_reason"]})
+                    ["date", "side", "strike", "pnl_points", "exit_reason", "flag_invalid_price"]})
 
     # ------------------------------------------------------------------
     # Daily log row
@@ -133,20 +149,16 @@ class Journal:
         date_str: str,
         symbol: str,
         ltp: float,
-        bid: float,
-        ask: float,
         event: str = "",
-        bid_qty: int = 0,
-        ask_qty: int = 0,
     ) -> None:
+        """
+        Write a single LTP tick record.  Only ltp is stored — no bid/ask.
+        Timestamp is tz-aware IST (with +05:30 offset).
+        """
         record = {
             "ts": datetime.now(IST).isoformat(),
             "symbol": symbol,
             "ltp": ltp,
-            "bid": bid,
-            "ask": ask,
-            "bid_qty": bid_qty,
-            "ask_qty": ask_qty,
             "event": event,
         }
         try:
@@ -158,6 +170,9 @@ class Journal:
 
     # ------------------------------------------------------------------
     # Chain snapshot (09:20)
+    # Note: the snapshot is written raw from the API response.
+    # bid/ask fields in ChainRow are stored verbatim for archival
+    # but are NEVER read back by strategy logic.
     # ------------------------------------------------------------------
 
     def write_chain_snapshot(self, date_str: str, rows: list, snapshot_ts: str) -> None:
@@ -171,6 +186,7 @@ class Journal:
                 {
                     "strike": r.strike, "option_type": r.option_type,
                     "symbol": r.symbol, "ltp": r.ltp,
+                    # bid/ask stored as-is from API (archival only, not used in logic):
                     "bid": r.bid, "ask": r.ask, "oi": r.oi, "iv": r.iv,
                 }
                 for r in rows

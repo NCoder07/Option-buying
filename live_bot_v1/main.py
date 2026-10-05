@@ -268,7 +268,7 @@ def main() -> None:
 
     if mode == "paper":
         from bot.paper_broker import PaperBroker
-        broker = PaperBroker(live_broker)
+        broker = PaperBroker(live_broker, config=config)
     else:
         broker = live_broker
 

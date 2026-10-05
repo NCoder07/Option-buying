@@ -5,6 +5,8 @@ This is the ONLY file that imports Dhan_Tradehull.
 All calls are logged with latency.
 No orders are placed in paper mode (paper-mode check is enforced in lifecycle.py,
 not here — this class always does what it's told).
+
+Pricing model: all market data is LTP-only.  No bid/ask is used for decisions.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Optional
 import pytz
 
 from .broker_port import (
-    BrokerPort, ChainRow, Fill, OrderStatus, Position, Quote,
+    BrokerPort, ChainRow, Fill, LTPSnapshot, OrderStatus, Position,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,26 +113,29 @@ class LiveDhanBroker(BrokerPort):
             logger.error("get_ltp failed: %s", e)
             return {}
 
-    def get_quote(self, symbol: str) -> Optional[Quote]:
+    def get_ltp_single(self, symbol: str) -> Optional[LTPSnapshot]:
+        """
+        Return LTPSnapshot for one symbol.  Uses get_ltp_data([symbol]) which
+        returns a {symbol: ltp} dict from Tradehull.  Records a tz-aware IST
+        timestamp at the moment of receipt for freshness checks.
+        """
         try:
             t0 = time.perf_counter()
-            raw = self._th.get_quote_data([symbol])
+            result = self._th.get_ltp_data([symbol])
             lat = (time.perf_counter() - t0) * 1000
-            logger.debug("get_quote(%s) latency=%.0f ms", symbol, lat)
-            if not raw or symbol not in raw:
+            if not result or symbol not in result:
+                logger.warning("get_ltp_single(%s): empty response (%.0f ms)", symbol, lat)
                 return None
-            d = raw[symbol]
-            return Quote(
-                symbol=symbol,
-                ltp=float(d.get("last_price", 0)),
-                bid=float(d.get("top_bid_price", 0)),
-                ask=float(d.get("top_ask_price", 0)),
-                bid_qty=int(d.get("top_bid_quantity", 0)),
-                ask_qty=int(d.get("top_ask_quantity", 0)),
-                timestamp=datetime.now(IST),
-            )
+            ltp = float(result[symbol])
+            if ltp <= 0:
+                logger.warning("get_ltp_single(%s): ltp=%.4f <= 0", symbol, ltp)
+                return None
+            ts = datetime.now(IST)
+            logger.debug("get_ltp_single(%s) ltp=%.2f ts=%s latency=%.0f ms",
+                         symbol, ltp, ts.isoformat(), lat)
+            return LTPSnapshot(symbol=symbol, ltp=ltp, timestamp=ts)
         except Exception as e:
-            logger.error("get_quote(%s) failed: %s", symbol, e)
+            logger.error("get_ltp_single(%s) failed: %s", symbol, e)
             return None
 
     def get_option_chain_snapshot(
@@ -144,6 +149,9 @@ class LiveDhanBroker(BrokerPort):
         Bypasses Tradehull's get_option_chain() wrapper (which internally calls
         get_ltp_data("NIFTY 50") and fails on that symbol string). Instead we
         call the underlying dhanhq.option_chain() directly, which works correctly.
+
+        bid/ask fields from the API are stored verbatim in each ChainRow for
+        archival in the snapshot JSON.  They are NOT used by strategy logic.
         """
         try:
             import pandas as pd
@@ -180,6 +188,7 @@ class LiveDhanBroker(BrokerPort):
                 for opt_type, side_key in [("CE", "ce"), ("PE", "pe")]:
                     side = data.get(side_key, {})
                     ltp = float(side.get("last_price") or 0)
+                    # Store raw bid/ask for snapshot archival only — not used in logic
                     bid = float(side.get("top_bid_price") or 0)
                     ask = float(side.get("top_ask_price") or 0)
                     oi  = side.get("oi")
@@ -210,14 +219,14 @@ class LiveDhanBroker(BrokerPort):
 
         Returns SEM_CUSTOM_SYMBOL (e.g. "NIFTY 06 OCT 22850 CALL") which:
           - is already fully uppercase, so survives Tradehull's internal
-            name.upper() call in both get_quote_data() and order_placement()
+            name.upper() call in both get_ltp_data() and order_placement()
           - matches instrument_df[SEM_CUSTOM_SYMBOL] after upper(), giving a
             correct security_id lookup in both APIs.
 
         Why NOT SEM_TRADING_SYMBOL ("NIFTY-Oct2026-22850-CE"):
           - Tradehull uppercases it to "NIFTY-OCT2026-22850-CE", which does
             NOT match the mixed-case value stored in the instrument master,
-            so the lookup fails silently and returns an empty quote dict.
+            so the lookup fails silently and returns an empty LTP dict.
 
         Root cause of the previous NaN crash:
           - SEM_STRIKE_PRICE contains NaN for non-option rows.

@@ -11,6 +11,8 @@ Expected data layout (same as Options Simulator):
 
 The broker replays candles as if they arrived in real time.  Speed is
 controlled by replay_speed config key (0.0 = as fast as possible, 1.0 = real).
+
+Pricing model: all fills use LTP ± paper_slippage_points.  No bid/ask.
 """
 
 from __future__ import annotations
@@ -27,11 +29,13 @@ import pandas as pd
 import pytz
 
 from .broker_port import (
-    BrokerPort, ChainRow, Fill, OrderStatus, Position, Quote,
+    BrokerPort, ChainRow, Fill, LTPSnapshot, OrderStatus, Position,
 )
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+
+_DEFAULT_SLIPPAGE = 1.0
 
 
 class ReplayBroker(BrokerPort):
@@ -50,6 +54,7 @@ class ReplayBroker(BrokerPort):
         self._data_dir = data_dir
         self._config = config
         self._replay_speed = float(config.get("replay_speed", 0.0))
+        self._slippage = float(config.get("paper_slippage_points", _DEFAULT_SLIPPAGE))
         self._tick_frames: dict[str, pd.DataFrame] = {}   # symbol -> sorted candles
         self._current_idx: int = 0
         self._current_time: Optional[datetime] = None
@@ -157,19 +162,16 @@ class ReplayBroker(BrokerPort):
                 result[sym] = float(row.get("close", row.get("ltp", 0)))
         return result
 
-    def get_quote(self, symbol: str) -> Optional[Quote]:
+    def get_ltp_single(self, symbol: str) -> Optional[LTPSnapshot]:
         row = self._tick_data_for_time.get(symbol)
         if row is None:
             return None
         ltp = float(row.get("close", row.get("ltp", 0)))
-        # Simulate bid/ask with a small spread if not in data
-        bid = float(row.get("bid", ltp - 0.05))
-        ask = float(row.get("ask", ltp + 0.05))
-        return Quote(
+        if ltp <= 0:
+            return None
+        return LTPSnapshot(
             symbol=symbol,
             ltp=ltp,
-            bid=bid,
-            ask=ask,
             timestamp=self._current_time,
         )
 
@@ -185,8 +187,6 @@ class ReplayBroker(BrokerPort):
         for sym, row in self._tick_data_for_time.items():
             if "CE" in sym or "PE" in sym:
                 ltp = float(row.get("close", row.get("ltp", 0)))
-                bid = float(row.get("bid", ltp - 0.05))
-                ask = float(row.get("ask", ltp + 0.05))
                 # Parse strike from symbol name (best-effort)
                 try:
                     parts = sym.split()
@@ -196,8 +196,7 @@ class ReplayBroker(BrokerPort):
                     strike = 0
                     opt_type = "CE" if "CE" in sym else "PE"
                 rows.append(ChainRow(
-                    strike=strike, option_type=opt_type, symbol=sym,
-                    ltp=ltp, bid=bid, ask=ask,
+                    strike=strike, option_type=opt_type, symbol=sym, ltp=ltp,
                 ))
         return rows
 
@@ -211,8 +210,18 @@ class ReplayBroker(BrokerPort):
         qty: int,
         tag: Optional[str] = None,
     ) -> Optional[str]:
-        quote = self.get_quote(symbol)
-        fill_price = quote.ask if (quote and quote.ask > 0) else price
+        snap = self.get_ltp_single(symbol)
+        if snap is None:
+            order_id = f"REPLAY-{uuid.uuid4().hex[:8].upper()}"
+            self._orders[order_id] = {
+                "symbol": symbol, "side": "BUY", "qty": qty,
+                "fill_price": 0.0, "status": OrderStatus.REJECTED,
+                "rejection_reason": "no_valid_price",
+            }
+            logger.error("[REPLAY] BUY %s qty=%d REJECTED (no_valid_price)", symbol, qty)
+            return order_id
+
+        fill_price = round(snap.ltp + self._slippage, 2)
         order_id = f"REPLAY-{uuid.uuid4().hex[:8].upper()}"
         self._orders[order_id] = {
             "symbol": symbol, "side": "BUY", "qty": qty,
@@ -225,7 +234,7 @@ class ReplayBroker(BrokerPort):
             pos.qty = total
         else:
             self._positions[symbol] = Position(symbol=symbol, qty=qty, avg_price=fill_price)
-        logger.debug("[REPLAY] BUY %s qty=%d @ %.2f", symbol, qty, fill_price)
+        logger.debug("[REPLAY] BUY %s qty=%d ltp=%.2f fill=%.2f", symbol, qty, snap.ltp, fill_price)
         return order_id
 
     def place_limit_sell(
@@ -235,8 +244,18 @@ class ReplayBroker(BrokerPort):
         qty: int,
         tag: Optional[str] = None,
     ) -> Optional[str]:
-        quote = self.get_quote(symbol)
-        fill_price = quote.bid if (quote and quote.bid > 0) else price
+        snap = self.get_ltp_single(symbol)
+        if snap is None:
+            order_id = f"REPLAY-{uuid.uuid4().hex[:8].upper()}"
+            self._orders[order_id] = {
+                "symbol": symbol, "side": "SELL", "qty": qty,
+                "fill_price": 0.0, "status": OrderStatus.REJECTED,
+                "rejection_reason": "no_valid_price",
+            }
+            logger.error("[REPLAY] SELL %s qty=%d REJECTED (no_valid_price)", symbol, qty)
+            return order_id
+
+        fill_price = max(round(snap.ltp - self._slippage, 2), 0.05)
         order_id = f"REPLAY-{uuid.uuid4().hex[:8].upper()}"
         self._orders[order_id] = {
             "symbol": symbol, "side": "SELL", "qty": qty,
@@ -247,7 +266,7 @@ class ReplayBroker(BrokerPort):
             pos.qty -= qty
             if pos.qty <= 0:
                 del self._positions[symbol]
-        logger.debug("[REPLAY] SELL %s qty=%d @ %.2f", symbol, qty, fill_price)
+        logger.debug("[REPLAY] SELL %s qty=%d ltp=%.2f fill=%.2f", symbol, qty, snap.ltp, fill_price)
         return order_id
 
     def cancel_order(self, order_id: str) -> bool:
@@ -268,6 +287,7 @@ class ReplayBroker(BrokerPort):
             order_id=order_id, status=status,
             avg_price=rec.get("fill_price", 0.0),
             filled_qty=filled, remaining_qty=qty - filled,
+            rejection_reason=rec.get("rejection_reason"),
         )
 
     def get_positions(self) -> list[Position]:
