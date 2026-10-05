@@ -7,12 +7,34 @@ No orders are placed in paper mode (paper-mode check is enforced in lifecycle.py
 not here — this class always does what it's told).
 
 Pricing model: all market data is LTP-only.  No bid/ask is used for decisions.
+
+Tradehull noise suppression
+---------------------------
+Tradehull's get_ltp_data() catches all exceptions internally and re-logs them
+through Python's root logger at ERROR level with a full traceback.  This
+produces one console line + one ERROR log entry per failed LTP call.  When the
+market is closed or the API returns an empty response, every 1 Hz poll tick
+generates this noise.
+
+We suppress the specific "Exception at calling ltp as" root-logger message by
+installing a logging.Filter on the root logger after connect().  The filter
+drops records originating from Dhan_Tradehull that match that pattern so they
+don't appear in our logs.  The WARNING emitted by get_ltp_single() still fires,
+giving full observability without the traceback flood.
+
+LTP back-off
+------------
+get_ltp_single() tracks consecutive failures per symbol.  After
+LTP_CONSECUTIVE_FAIL_THRESHOLD failures it stops calling the API for
+LTP_BACKOFF_SEC seconds (configurable; defaults below).  This prevents
+hammering Dhan's API during market-closed periods or rate-limit windows.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import Optional
@@ -25,6 +47,21 @@ from .broker_port import (
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+
+# LTP back-off settings (conservative defaults; can be overridden via config)
+_LTP_CONSECUTIVE_FAIL_THRESHOLD = 5   # failures before backing off
+_LTP_BACKOFF_SEC = 30                 # seconds to wait before retrying
+
+_TRADEHULL_NOISE_RE = re.compile(r"Exception at calling ltp as")
+
+
+class _TradehullNoiseFilter(logging.Filter):
+    """Drop the noisy 'Exception at calling ltp as ...' root-logger records."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Only suppress records from Dhan_Tradehull that match the LTP noise pattern
+        if _TRADEHULL_NOISE_RE.search(record.getMessage()):
+            return False
+        return True
 
 
 class LiveDhanBroker(BrokerPort):
@@ -53,6 +90,8 @@ class LiveDhanBroker(BrokerPort):
         self._client_code = client_code
         self._pin = pin
         self._totp_secret = totp_secret
+        # LTP back-off state: {symbol: (consecutive_failures, suppressed_until_ts)}
+        self._ltp_backoff: dict[str, tuple[int, float]] = {}
 
     # ------------------------------------------------------------------
     # Login / refresh
@@ -78,6 +117,11 @@ class LiveDhanBroker(BrokerPort):
             lat = (time.perf_counter() - t0) * 1000
             self._instrument_df = self._th.instrument_df
             logger.info("Dhan login OK (%.0f ms)", lat)
+            # Install noise filter on root logger to suppress Tradehull's own
+            # "Exception at calling ltp as ..." traceback spam.
+            _noise_filter = _TradehullNoiseFilter()
+            logging.getLogger().addFilter(_noise_filter)
+            logger.debug("Tradehull LTP noise filter installed on root logger")
         finally:
             os.chdir(original_cwd)
 
@@ -118,14 +162,41 @@ class LiveDhanBroker(BrokerPort):
         Return LTPSnapshot for one symbol.  Uses get_ltp_data([symbol]) which
         returns a {symbol: ltp} dict from Tradehull.  Records a tz-aware IST
         timestamp at the moment of receipt for freshness checks.
+
+        Back-off: after LTP_CONSECUTIVE_FAIL_THRESHOLD consecutive failures for
+        a symbol, suppress API calls for LTP_BACKOFF_SEC seconds.  The caller
+        receives None (no_data) during the backoff window.  This prevents
+        hammering the API when the market is closed or the symbol is invalid.
         """
+        # Check back-off
+        now_ts = time.monotonic()
+        fails, suppressed_until = self._ltp_backoff.get(symbol, (0, 0.0))
+        if now_ts < suppressed_until:
+            return None   # silent: lifecycle already logged "skipping tick"
+
         try:
             t0 = time.perf_counter()
             result = self._th.get_ltp_data([symbol])
             lat = (time.perf_counter() - t0) * 1000
             if not result or symbol not in result:
-                logger.warning("get_ltp_single(%s): empty response (%.0f ms)", symbol, lat)
+                # Tradehull returned empty/failure — count as a failure
+                fails += 1
+                if fails >= _LTP_CONSECUTIVE_FAIL_THRESHOLD:
+                    logger.warning(
+                        "get_ltp_single(%s): %d consecutive failures — "
+                        "backing off for %ds",
+                        symbol, fails, _LTP_BACKOFF_SEC,
+                    )
+                    self._ltp_backoff[symbol] = (fails, now_ts + _LTP_BACKOFF_SEC)
+                else:
+                    logger.warning(
+                        "get_ltp_single(%s): empty response (%.0f ms) [fail %d/%d]",
+                        symbol, lat, fails, _LTP_CONSECUTIVE_FAIL_THRESHOLD,
+                    )
+                    self._ltp_backoff[symbol] = (fails, 0.0)
                 return None
+            # Success — reset back-off counter
+            self._ltp_backoff[symbol] = (0, 0.0)
             ltp = float(result[symbol])
             if ltp <= 0:
                 logger.warning("get_ltp_single(%s): ltp=%.4f <= 0", symbol, ltp)
@@ -136,6 +207,11 @@ class LiveDhanBroker(BrokerPort):
             return LTPSnapshot(symbol=symbol, ltp=ltp, timestamp=ts)
         except Exception as e:
             logger.error("get_ltp_single(%s) failed: %s", symbol, e)
+            fails += 1
+            if fails >= _LTP_CONSECUTIVE_FAIL_THRESHOLD:
+                self._ltp_backoff[symbol] = (fails, now_ts + _LTP_BACKOFF_SEC)
+            else:
+                self._ltp_backoff[symbol] = (fails, 0.0)
             return None
 
     def get_option_chain_snapshot(

@@ -225,6 +225,21 @@ class PaperBroker(BrokerPort):
     def get_order_status(self, order_id: str) -> Fill:
         rec = self._orders.get(order_id)
         if not rec:
+            # If this is a paper order ID from a previous run (lost on restart),
+            # return FILLED so reconcile() doesn't halt.  The fill price is unknown
+            # but the position is already recorded in the DB with the correct avg_fill.
+            if order_id.startswith("PAPER-"):
+                logger.debug(
+                    "get_order_status(%s): paper order from prior run — assuming FILLED",
+                    order_id,
+                )
+                return Fill(
+                    order_id=order_id,
+                    status=OrderStatus.FILLED,
+                    avg_price=0.0,   # unknown after restart; DB value is authoritative
+                    filled_qty=0,
+                    remaining_qty=0,
+                )
             return Fill(
                 order_id=order_id,
                 status=OrderStatus.UNKNOWN,
